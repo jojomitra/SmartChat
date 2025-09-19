@@ -1,3 +1,20 @@
+# Streamlit & secrets
+.streamlit/secrets.toml
+secrets.toml
+
+# Build / distro
+dist/
+build/
+
+# Local indexes / caches / dbs
+*.sqlite
+index.json
+*.pkl
+
+# OS files
+.DS_Store
+Thumbs.db
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
