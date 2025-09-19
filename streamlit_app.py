@@ -151,6 +151,74 @@ def list_files_in_bucket(prefix: str = ""):
         # return empty list rather than crash in UI
         return []
 
+def get_text_from_upload(file_obj) -> str:
+    """
+    Robust extractor for uploaded content.
+    Accepts:
+      - raw bytes or bytearray
+      - str (already text)
+      - file-like objects with .read() (BytesIO, TextIO, uploaded file)
+      - path string to a file on disk
+    Returns decoded text (possibly empty) and never raises (returns explanatory string on error).
+    """
+    try:
+        # If a path was provided, open the file
+        if isinstance(file_obj, (str, os.PathLike)):
+            try:
+                with open(file_obj, "rb") as fh:
+                    raw = fh.read()
+            except Exception as e:
+                return f"[error opening file path: {e}]"
+
+        # bytes or bytearray -> decode
+        elif isinstance(file_obj, (bytes, bytearray)):
+            raw = bytes(file_obj)
+
+        # file-like object with read()
+        elif hasattr(file_obj, "read"):
+            try:
+                # some streams are text streams, some are bytes streams
+                raw = file_obj.read()
+            except Exception as e:
+                return f"[error reading file-like object: {e}]"
+
+            # If read() returned a string already, return it
+            if isinstance(raw, str):
+                return raw
+
+            # else fall through to decode bytes
+
+        # If it's already a Python str
+        elif isinstance(file_obj, str):
+            return file_obj
+
+        else:
+            return f"[unsupported upload object type: {type(file_obj)}]"
+
+        # At this point, raw should be bytes or bytearray
+        if raw is None:
+            return ""
+
+        if isinstance(raw, (bytes, bytearray)):
+            # try utf-8 then latin-1 as fallback
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    return raw.decode("latin-1")
+                except Exception:
+                    # as last resort, return repr truncated
+                    return repr(raw)[:1000]
+        elif isinstance(raw, str):
+            return raw
+        else:
+            # Unexpected type (e.g. memoryview)
+            try:
+                return bytes(raw).decode("utf-8", errors="ignore")
+            except Exception:
+                return f"[unhandled raw type: {type(raw)}]"
+    except Exception as e:
+        return f"[extractor error: {e}]"
 
 # App UI -------------------------------------------------------------------
 st.title("Upload → Supabase → Llama-Index (Streamlit)")
