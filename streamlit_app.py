@@ -7,16 +7,28 @@ import tempfile
 import streamlit as st
 import importlib
 
+# use a safe fallback import block
 try:
-    import llama_index
-    st.write("llama_index module:", llama_index)
-    st.write("llama_index.__version__:", getattr(llama_index, "__version__", "unknown"))
-except Exception as e:
-    st.write("Could not import llama_index at top-level:", e)
+    # newer-ish versions expose core objects here
+    from llama_index.core import Document
+except Exception:
+    try:
+        # older examples and docs sometimes use top-level export
+        from llama_index import Document
+    except Exception:
+        # last resort: try schema path
+        from llama_index.core.schema import Document
 
+# index import (also may move between versions)
+try:
+    from llama_index import GPTVectorStoreIndex
+except Exception:
+    try:
+        from llama_index.indices import GPTVectorStoreIndex
+    except Exception:
+        # if this fails, the package version likely doesn't provide it under these names
+        GPTVectorStoreIndex = None
 
-# Llama-Index imports (API names may slightly vary by version)
-from llama_index import Document, GPTVectorStoreIndex
 from supabase import create_client
 
 # --- Configuration / secrets ---
