@@ -50,7 +50,7 @@ os.environ["OPENAI_API_KEY"] = OPENAI_KEY
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Helpers ------------------------------------------------------------------
-# Robust Supabase helpers — REPLACE your existing helpers with this block
+# Robust Supabase helpers
 
 def upload_file_to_supabase(file_bytes: bytes, path: str):
     """
@@ -130,7 +130,7 @@ def download_file_from_supabase(path: str) -> bytes | None:
         err = str(e).lower()
         if "not found" in err or "404" in err:
             return None
-        # re-raise for unexpected failures
+        # re-raise for unexpected failures so the app shows the error
         raise
 
 
@@ -147,9 +147,10 @@ def list_files_in_bucket(prefix: str = ""):
             return bucket.list()
         except Exception as e:
             raise RuntimeError(f"listing bucket failed: {e}") from e
-    except Exception as e:
+    except Exception:
         # return empty list rather than crash in UI
         return []
+
 
 # App UI -------------------------------------------------------------------
 st.title("Upload → Supabase → Llama-Index (Streamlit)")
