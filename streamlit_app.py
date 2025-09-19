@@ -3,7 +3,17 @@ import os
 import io
 import json
 import tempfile
+
 import streamlit as st
+import importlib
+
+try:
+    import llama_index
+    st.write("llama_index module:", llama_index)
+    st.write("llama_index.__version__:", getattr(llama_index, "__version__", "unknown"))
+except Exception as e:
+    st.write("Could not import llama_index at top-level:", e)
+
 
 # Llama-Index imports (API names may slightly vary by version)
 from llama_index import Document, GPTVectorStoreIndex
