@@ -50,53 +50,113 @@ os.environ["OPENAI_API_KEY"] = OPENAI_KEY
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Helpers ------------------------------------------------------------------
-def upload_file_to_supabase(file_bytes: bytes, path: str):
-    """Upload bytes to Supabase Storage at given path (overwrites if exists)."""
-    # supabase-py storage API
-    res = supabase.storage.from_(SUPABASE_BUCKET).upload(path, io.BytesIO(file_bytes), {'cacheControl': '3600'}, upsert=True)
-    # If upload returns error structure, it may be in res
-    return res
+# --- Robust Supabase helpers (replace your current helpers with these) ---
+import io
 
-def download_file_from_supabase(path: str) -> bytes:
-    """Return bytes from Supabase Storage path or None if missing."""
-    data = supabase.storage.from_(SUPABASE_BUCKET).download(path)
-    if data is None:
-        return None
-    return data
+def upload_file_to_supabase(file_bytes: bytes, path: str):
+    """
+    Upload bytes to Supabase Storage at `path`.
+    This function:
+      - first attempts a normal upload(...)
+      - if that raises because the object exists, it attempts update(...)
+      - returns the raw response dict/object for inspection
+    """
+    bucket = supabase.storage.from_(SUPABASE_BUCKET)
+    file_like = io.BytesIO(file_bytes)
+
+    # Try the simplest call first (no upsert kw)
+    try:
+        res = bucket.upload(path, file_like)
+        return res
+    except TypeError as te:
+        # some versions accept different args; fall back to upload without kwargs
+        try:
+            file_like.seek(0)
+            res = bucket.upload(path, file_like)  # retry
+            return res
+        except Exception as e:
+            # if upload fails because file already exists, try update()
+            err_text = str(e).lower()
+            if "already exists" in err_text or "object already exists" in err_text or "409" in err_text:
+                try:
+                    file_like.seek(0)
+                    res2 = bucket.update(path, file_like)
+                    return res2
+                except Exception as e2:
+                    raise RuntimeError(f"Upload failed and update fallback failed: {e2}") from e2
+            else:
+                # unknown error - try update anyway
+                try:
+                    file_like.seek(0)
+                    res2 = bucket.update(path, file_like)
+                    return res2
+                except Exception as e2:
+                    raise RuntimeError(f"Upload failed and update fallback also failed: {e2}") from e2
+    except Exception as exc:
+        # Generic fallback: try update (replace existing file)
+        try:
+            file_like.seek(0)
+            resu = bucket.update(path, file_like)
+            return resu
+        except Exception as e2:
+            # give a helpful error with both exceptions
+            raise RuntimeError(f"upload() error: {exc}; update() fallback error: {e2}") from e2
+
+
+def download_file_from_supabase(path: str) -> bytes | None:
+    """
+    Download bytes for a given path. Handles different return formats.
+    Returns bytes or None (if not found).
+    """
+    bucket = supabase.storage.from_(SUPABASE_BUCKET)
+    try:
+        data = bucket.download(path)
+        # older/newer clients may return a bytes-like or a dict {'data': Buffer}
+        if data is None:
+            return None
+        # If the returned object has a .read() (like a HTTP response)
+        if hasattr(data, "read"):
+            return data.read()
+        # If dictionary with 'data' key
+        if isinstance(data, dict) and "data" in data:
+            return data["data"]
+        # If it's already bytes/bytearray
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        # otherwise attempt to convert to bytes
+        try:
+            return bytes(data)
+        except Exception:
+            return None
+    except Exception as e:
+        # Not found or other error
+        err = str(e).lower()
+        if "not found" in err or "404" in err:
+            return None
+        # re-raise for unexpected failures so you can see the message in Streamlit
+        raise
+
 
 def list_files_in_bucket(prefix: str = ""):
-    objs = supabase.storage.from_(SUPABASE_BUCKET).list(prefix)
-    return objs
-
-def get_text_from_upload(file_obj) -> str:
-    """Simple multipurpose extractor. Expand as needed for PDFs, docx, etc."""
-    # for small text files: decode directly
+    """
+    List objects in bucket. Many supabase clients accept list(prefix) or list().
+    Return a python list (or empty list).
+    """
+    bucket = supabase.storage.from_(SUPABASE_BUCKET)
     try:
-        raw = file_obj.read()
-        # if bytes -> decode
-        if isinstance(raw, bytes):
-            return raw.decode("utf-8", errors="ignore")
-        else:
-            return str(raw)
-    except Exception as e:
-        return ""
-
-def save_index_to_tempfile(index, filename="index.json"):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-    path = tmp.name
-    try:
-        index.save_to_disk(path)
-    except Exception as e:
-        # some versions use a different save signature; fallback to writing JSON if available
+        objs = bucket.list(prefix)
+        return objs
+    except TypeError:
+        # some versions expect no arg
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(json.dumps(index.__dict__, default=str))
-        except Exception:
-            raise
-    return path
+            objs = bucket.list()
+            return objs
+        except Exception as e:
+            raise RuntimeError(f"listing bucket failed: {e}") from e
+    except Exception as e:
+        # return empty list rather than crash
+        return []
 
-def load_index_from_disk(path):
-    return GPTVectorStoreIndex.load_from_disk(path)
 
 # App UI -------------------------------------------------------------------
 st.title("Upload → Supabase → Llama-Index (Streamlit)")
