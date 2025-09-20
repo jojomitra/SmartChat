@@ -1,7 +1,9 @@
 streamlit
 openai
-llama-index
+llama-index==0.10.17
 supabase
 numpy
 tqdm
 python-multipart
+pdfplumber
+python-docx
