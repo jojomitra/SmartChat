@@ -1,4 +1,11 @@
 # streamlit_app.py
+"""
+Streamlit app: upload -> Supabase -> (optional) llama-index build -> query.
+This file is robust to different supabase-py and llama-index versions and
+provides an OpenAI fallback when llama-index index classes aren't available.
+Add secrets (Streamlit secrets or environment vars):
+  SUPABASE_URL, SUPABASE_KEY, OPENAI_KEY, SUPABASE_BUCKET (optional, default "uploads")
+"""
 import os
 import io
 import tempfile
@@ -11,10 +18,8 @@ from typing import Optional
 import streamlit as st
 
 # ---------------------------
-# CONFIG / SECRETS (Streamlit Secrets recommended)
+# CONFIG / SECRETS
 # ---------------------------
-# Add to Streamlit Cloud Secrets (or set env vars):
-# SUPABASE_URL, SUPABASE_KEY, OPENAI_KEY, SUPABASE_BUCKET (optional, default "uploads")
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", None)
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", None)
 OPENAI_KEY = st.secrets.get("OPENAI_KEY", None)
@@ -32,23 +37,24 @@ os.environ["OPENAI_API_KEY"] = OPENAI_KEY
 # ---------------------------
 try:
     from supabase import create_client as create_supabase_client
-except Exception:
+except Exception as e:
     st.error("Failed to import supabase.create_client. Install `supabase` package or pin a supported version in requirements.txt.")
     st.stop()
 
 supabase = create_supabase_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------------------------
-# Dynamic discovery for llama-index objects (Document and an Index class)
+# Dynamic discovery for llama-index objects (Document and Index class)
 # ---------------------------
 DetectedDocument = None
 DetectedIndexClass = None
 DetectedIndexName = None
 DetectedIndexModule = None
+llama_pkg = None
 
 def find_in_package(pkg, name_substrings):
-    """Scan top-level attrs and one-level submodules in pkg for attributes containing any substring."""
-    # top-level
+    """Scan top-level attrs and one-level submodules for attributes with name substrings."""
+    # top-level attributes
     for attr in dir(pkg):
         for sub in name_substrings:
             if sub.lower() in attr.lower():
@@ -59,9 +65,10 @@ def find_in_package(pkg, name_substrings):
                 except Exception:
                     pass
     # one-level submodules
-    if getattr(pkg, "__path__", None) is None:
+    pkg_path = getattr(pkg, "__path__", None)
+    if not pkg_path:
         return None, None, None
-    for finder, modname, ispkg in pkgutil.iter_modules(pkg.__path__):
+    for finder, modname, ispkg in pkgutil.iter_modules(pkg_path):
         fullname = f"{pkg.__name__}.{modname}"
         try:
             subpkg = importlib.import_module(fullname)
@@ -78,19 +85,19 @@ def find_in_package(pkg, name_substrings):
                         pass
     return None, None, None
 
-# Try to import llama_index and print diagnostics in UI
+# Attempt to import llama_index and detect Document/index classes
 try:
     llama_pkg = importlib.import_module("llama_index")
     st.write("Detected llama_index package path:", getattr(llama_pkg, "__path__", None))
     st.write("Top-level names (slice):", [n for n in dir(llama_pkg)][:200])
 except Exception as e:
-    st.write("Failed to import llama_index package:", e)
+    st.write("llama_index import failed or minimal stub present:", e)
     llama_pkg = None
 
-# Find Document
+# Find Document-like object
 if llama_pkg is not None:
-    cand_doc_names = ["Document", "Node", "TextNode"]
-    for nm in cand_doc_names:
+    doc_candidates = ["Document", "Node", "TextNode"]
+    for nm in doc_candidates:
         if hasattr(llama_pkg, nm):
             try:
                 DetectedDocument = getattr(llama_pkg, nm)
@@ -104,7 +111,7 @@ if llama_pkg is not None:
             DetectedDocument = doc_obj
             st.write(f"Found Document in {doc_mod}.{doc_attr}")
 
-# Find an index class
+# Find Index class
 index_search_terms = [
     "GPTVectorStoreIndex", "GPTSimpleVectorIndex", "SimpleVectorIndex",
     "VectorStoreIndex", "VectorIndex", "GPTVectorIndex", "SimpleIndex", "GPTSimpleIndex"
@@ -128,9 +135,9 @@ if llama_pkg is not None:
             DetectedIndexModule = idx_mod
             st.write(f"Found Index class in {idx_mod}.{idx_attr}")
 
-# Report status
+# Report results
 if DetectedDocument is None:
-    st.warning("Document class NOT found inside llama-index. Some features will use OpenAI fallback instead.")
+    st.warning("Document class NOT found inside llama-index. OpenAI fallback will be used for queries.")
 else:
     st.write(f"Using detected Document: {DetectedDocument}")
 
@@ -140,29 +147,25 @@ else:
     st.write(f"Using detected Index class `{DetectedIndexName}` from module `{DetectedIndexModule}`")
 
 # ---------------------------
-# Robust Supabase helpers (support multiple client APIs)
+# Robust Supabase helpers
 # ---------------------------
 def upload_file_to_supabase(file_bytes: bytes, path: str):
-    """
-    Upload bytes to Supabase Storage at `path`. Tries multiple patterns to
-    support different supabase-py versions.
-    """
     bucket = supabase.storage.from_(SUPABASE_BUCKET)
-    # 1) upload bytes
+    # Try upload bytes
     try:
         return bucket.upload(path, file_bytes)
     except Exception as e1:
-        # 2) upload BytesIO
+        # Try upload BytesIO
         try:
             bio = io.BytesIO(file_bytes)
             bio.seek(0)
             return bucket.upload(path, bio)
         except Exception as e2:
-            # 3) update bytes
+            # Try update bytes
             try:
                 return bucket.update(path, file_bytes)
             except Exception as e3:
-                # 4) update path
+                # Try update with temporary file path
                 tmp = None
                 try:
                     tmp = tempfile.NamedTemporaryFile(delete=False)
@@ -190,20 +193,25 @@ def download_file_from_supabase(path: str) -> Optional[bytes]:
     bucket = supabase.storage.from_(SUPABASE_BUCKET)
     try:
         data = bucket.download(path)
-        if data is None:
-            return None
-        if isinstance(data, (bytes, bytearray)):
-            return bytes(data)
-        if hasattr(data, "read"):
-            return data.read()
-        if isinstance(data, dict) and "data" in data:
-            return data["data"]
-        return bytes(data)
     except Exception as e:
+        # If download raised, return None for not found patterns or re-raise
         estr = str(e).lower()
         if "not found" in estr or "404" in estr:
             return None
         raise
+
+    if data is None:
+        return None
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    if hasattr(data, "read"):
+        return data.read()
+    if isinstance(data, dict) and "data" in data:
+        return data["data"]
+    try:
+        return bytes(data)
+    except Exception:
+        return None
 
 def list_files_in_bucket(prefix: str = ""):
     bucket = supabase.storage.from_(SUPABASE_BUCKET)
@@ -218,7 +226,7 @@ def list_files_in_bucket(prefix: str = ""):
         return []
 
 # ---------------------------
-# Text extraction for uploaded files
+# Text extraction
 # ---------------------------
 def get_text_from_upload(file_obj) -> str:
     try:
@@ -270,21 +278,20 @@ def save_index_to_tempfile(index_obj, filename="index.bin"):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1] or ".bin")
     tmp_path = tmp.name
     tmp.close()
-
-    # library save_to_disk
-    try:
-        if hasattr(index_obj, "save_to_disk"):
+    # try library save_to_disk
+    if hasattr(index_obj, "save_to_disk"):
+        try:
             index_obj.save_to_disk(tmp_path)
             return tmp_path
-    except Exception:
-        pass
-    # library save
-    try:
-        if hasattr(index_obj, "save"):
+        except Exception:
+            pass
+    # try library save
+    if hasattr(index_obj, "save"):
+        try:
             index_obj.save(tmp_path)
             return tmp_path
-    except Exception:
-        pass
+        except Exception:
+            pass
     # fallback pickle
     try:
         with open(tmp_path, "wb") as fh:
@@ -311,13 +318,12 @@ def load_index_from_disk(path):
         raise RuntimeError(f"Failed to load index from disk (pickle fallback failed): {e}") from e
 
 # ---------------------------
-# Simple OpenAI fallback (uses uploaded text directly)
+# OpenAI simple fallback
 # ---------------------------
 def simple_llm_answer(context_text: str, question: str) -> str:
     try:
         import openai
         openai.api_key = OPENAI_KEY
-        # Trim context if too long
         max_context_chars = 14000
         if len(context_text) > max_context_chars:
             context_text = context_text[-max_context_chars:]
@@ -326,7 +332,7 @@ def simple_llm_answer(context_text: str, question: str) -> str:
             f"CONTEXT:\n{context_text}\n\nQUESTION:\n{question}\n\nAnswer concisely."
         )
         resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",  # replace if unavailable
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=512,
             temperature=0.0,
@@ -343,6 +349,7 @@ st.title("Upload → Supabase → Llama-Index (Streamlit)")
 
 tab1, tab2, tab3 = st.tabs(["Upload", "Index / Files", "Query"])
 
+# --- Tab 1: Upload ---
 with tab1:
     st.header("Upload a file (goes to Supabase)")
     uploaded = st.file_uploader("Choose a file (txt, md, small pdf text-only, docx).", accept_multiple_files=False)
@@ -364,7 +371,6 @@ with tab1:
                 st.error(f"Upload failed: {e}")
                 st.stop()
 
-            # extract text and store for fallback
             text = get_text_from_upload(io.BytesIO(bytes_data))
             st.session_state["uploaded_text"] = text
             if len(text.strip()) == 0:
@@ -375,17 +381,16 @@ with tab1:
                     if DetectedDocument is None or DetectedIndexClass is None:
                         st.warning("Index class or Document class not detected; cannot build llama-index index. Use OpenAI fallback or pin a compatible llama-index version.")
                     else:
+                        # instantiate Document robustly
                         try:
                             doc = DetectedDocument(text=text, metadata={"source": path})
                         except Exception:
-                            # older Document constructors may accept (text, metadata) differently; try fallback
                             try:
                                 doc = DetectedDocument(text, {"source": path})
                             except Exception as e:
                                 st.error(f"Failed to instantiate Document object: {e}")
                                 st.write(traceback.format_exc())
                                 st.stop()
-
                         st.info("Building index (this may take a few seconds)...")
                         try:
                             if hasattr(DetectedIndexClass, "from_documents"):
@@ -407,9 +412,7 @@ with tab1:
                             st.error(f"Failed to save/upload index: {e}")
                             st.write(traceback.format_exc())
 
-# ---------------------------
-# Updated Tab 2: Browse / Preview / Build-from-bucket / Load index
-# ---------------------------
+# --- Tab 2: Browse / Preview / Build-from-bucket / Load index ---
 with tab2:
     st.header("Browse files in Supabase bucket")
     try:
@@ -420,19 +423,15 @@ with tab2:
         st.error(f"Failed to list bucket: {e}")
         files = []
 
-    # build an options list for user selection (use name or path)
     file_names = []
     if isinstance(files, list):
         for f in files:
-            # support different return shapes (dict-like or object)
             if isinstance(f, dict) and "name" in f:
                 file_names.append(f["name"])
             else:
-                # try attribute access
                 try:
                     file_names.append(getattr(f, "name"))
                 except Exception:
-                    # last resort: str(f)
                     file_names.append(str(f))
 
     if len(file_names) == 0:
@@ -441,44 +440,34 @@ with tab2:
         selected = st.selectbox("Select a file to inspect / build index from", file_names)
         st.write("Selected file:", selected)
 
-        # preview: download and show first 1000 chars
         if st.button("Preview selected file"):
             try:
                 data = download_file_from_supabase(selected)
                 if data is None:
                     st.warning("Could not download selected file (maybe path mismatch or permissions).")
                 else:
-                    try:
-                        text_preview = get_text_from_upload(data)
-                        st.text_area("File preview (first 4000 chars)", value=text_preview[:4000], height=300)
-                        # store preview text in session for convenience
-                        st.session_state["last_preview_text"] = text_preview
-                    except Exception as e:
-                        st.error(f"Failed to extract preview text: {e}")
+                    text_preview = get_text_from_upload(data)
+                    st.text_area("File preview (first 4000 chars)", value=text_preview[:4000], height=300)
+                    st.session_state["last_preview_text"] = text_preview
             except Exception as e:
-                st.error(f"Download failed: {e}")
+                st.error(f"Download or preview failed: {e}")
                 st.write(traceback.format_exc())
 
-        # Build index from the selected file (server-side)
         if st.button("Build index from selected file and upload index.bin"):
-            # first download file
             try:
                 data = download_file_from_supabase(selected)
                 if data is None:
                     st.error("Download returned no data. Check file path/permissions and that SUPABASE_KEY is service_role for private buckets.")
                 else:
-                    st.info("Extracting text from the file...")
                     text = get_text_from_upload(data)
                     if not text or len(text.strip()) == 0:
                         st.error("Extracted no text from file. For PDFs or docx enable pdfplumber / python-docx and re-upload.")
                     else:
                         st.success(f"Extracted {len(text)} characters. Proceeding to build index (this may take a few seconds)...")
-                        # try to construct Document and build index
                         if DetectedDocument is None or DetectedIndexClass is None:
                             st.error("Detected Document or Index class is missing in the installed llama-index package. Cannot build a vector index here.")
                             st.info("Options: (1) Pin llama-index==0.10.17 in requirements.txt and redeploy, or (2) use OpenAI fallback in Query tab.")
                         else:
-                            # instantiate Document (try a couple of constructor styles)
                             try:
                                 doc = DetectedDocument(text=text, metadata={"source": selected})
                             except Exception:
@@ -488,7 +477,6 @@ with tab2:
                                     st.error(f"Failed to instantiate Document: {e}")
                                     st.write(traceback.format_exc())
                                     raise
-
                             try:
                                 if hasattr(DetectedIndexClass, "from_documents"):
                                     idx = DetectedIndexClass.from_documents([doc])
@@ -498,8 +486,6 @@ with tab2:
                                 st.error(f"Index construction failed: {e}")
                                 st.write(traceback.format_exc())
                                 raise
-
-                            # persist and upload index
                             try:
                                 idx_path = save_index_to_tempfile(idx, filename="index.bin")
                                 with open(idx_path, "rb") as fh:
@@ -513,7 +499,6 @@ with tab2:
                 st.error(f"Unexpected error during build: {e}")
                 st.write(traceback.format_exc())
 
-    # Load index from Supabase (existing index.bin)
     st.markdown("---")
     if st.button("Load index.bin from Supabase into session"):
         try:
@@ -537,13 +522,13 @@ with tab2:
                         os.unlink(tmp.name)
                     except Exception:
                         pass
+        except Exception as e:
+            st.error(f"Download failed: {e}")
+            st.write(traceback.format_exc())
 
-# ---------------------------
-# Query tab
-# ---------------------------
+# --- Tab 3: Query ---
 with tab3:
     st.header("Query the index / uploaded document")
-    # prefer vector index if present in session
     if "index" in st.session_state:
         q = st.text_input("Ask a question about your uploaded data (vector index):")
         if q:
@@ -575,7 +560,6 @@ with tab3:
                 st.error(f"Query failed: {e}")
                 st.write(traceback.format_exc())
     else:
-        # fallback to OpenAI using uploaded_text
         if st.session_state.get("uploaded_text"):
             st.info("No vector index loaded. Using OpenAI fallback on uploaded text.")
             q = st.text_input("Ask a question (using uploaded file as context):")
@@ -585,4 +569,3 @@ with tab3:
                     st.write(ans)
         else:
             st.info("No index loaded and no uploaded text available. Upload a file in 'Upload' tab first.")
-# end of file
