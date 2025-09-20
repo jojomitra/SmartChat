@@ -3,33 +3,116 @@ import os
 import io
 import json
 import tempfile
-
+import pickle
 import streamlit as st
 import importlib
 
-# use a safe fallback import block
-try:
-    # newer-ish versions expose core objects here
-    from llama_index.core import Document
-except Exception:
-    try:
-        # older examples and docs sometimes use top-level export
-        from llama_index import Document
-    except Exception:
-        # last resort: try schema path
-        from llama_index.core.schema import Document
+from supabase import create_client
 
-# index import (also may move between versions)
+Document = None
+GPTVectorStoreIndex = None
+GPTSimpleVectorIndex = None
+
+# ---------- Robust llama-index imports & helpers ----------
+import tempfile
+import pickle
+import streamlit as st
+
+# Try several known import locations for Document and index classes
+Document = None
+GPTVectorStoreIndex = None
+GPTSimpleVectorIndex = None
+
+# Document import fallbacks
 try:
-    from llama_index import GPTVectorStoreIndex
+    from llama_index import Document
 except Exception:
     try:
-        from llama_index.indices import GPTVectorStoreIndex
+        from llama_index.core.schema import Document
     except Exception:
-        # if this fails, the package version likely doesn't provide it under these names
+        try:
+            from llama_index.schema import Document
+        except Exception:
+            Document = None
+
+# GPTVectorStoreIndex fallbacks
+try:
+    from llama_index import GPTVectorStoreIndex as _gv
+    GPTVectorStoreIndex = _gv
+except Exception:
+    try:
+        from llama_index.indices.vector_store import GPTVectorStoreIndex as _gv
+        GPTVectorStoreIndex = _gv
+    except Exception:
         GPTVectorStoreIndex = None
 
-from supabase import create_client
+# GPTSimpleVectorIndex (older name) fallbacks
+try:
+    from llama_index import GPTSimpleVectorIndex as _gs
+    GPTSimpleVectorIndex = _gs
+except Exception:
+    try:
+        from llama_index import SimpleVectorIndex as _gs
+        GPTSimpleVectorIndex = _gs
+    except Exception:
+        try:
+            from llama_index.indices.simple import GPTSimpleVectorIndex as _gs
+            GPTSimpleVectorIndex = _gs
+        except Exception:
+            GPTSimpleVectorIndex = None
+
+# Choose whichever Index class is available
+def get_index_class():
+    for cls in (GPTVectorStoreIndex, GPTSimpleVectorIndex):
+        if cls is not None:
+            return cls
+    return None
+
+# Save index to a temp file robustly
+def save_index_to_tempfile(index, filename="index.bin"):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1] or ".bin")
+    path = tmp.name
+    tmp.close()
+    # Try library-provided save methods first
+    try:
+        if hasattr(index, "save_to_disk"):
+            index.save_to_disk(path)
+            return path
+    except Exception:
+        pass
+    try:
+        if hasattr(index, "save"):
+            index.save(path)
+            return path
+    except Exception:
+        pass
+    # Fallback: pickle the index object
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(index, f)
+        return path
+    except Exception as e:
+        raise RuntimeError(f"Failed to persist index to disk (tried save_to_disk/save/pickle): {e}") from e
+
+# Load index from disk robustly
+def load_index_from_disk(path):
+    # Try class-specific load methods
+    cls = get_index_class()
+    if cls is not None:
+        # try load_from_disk or load
+        for method in ("load_from_disk", "load", "from_disk"):
+            try:
+                fn = getattr(cls, method)
+                return fn(path)
+            except Exception:
+                pass
+    # fallback to pickle
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load index from disk (no index class worked, pickle fallback failed): {e}") from e
+
 
 # --- Configuration / secrets ---
 # In Streamlit Cloud put these into the app Secrets area, keys shown below:
