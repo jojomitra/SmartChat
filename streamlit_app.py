@@ -407,6 +407,9 @@ with tab1:
                             st.error(f"Failed to save/upload index: {e}")
                             st.write(traceback.format_exc())
 
+# ---------------------------
+# Updated Tab 2: Browse / Preview / Build-from-bucket / Load index
+# ---------------------------
 with tab2:
     st.header("Browse files in Supabase bucket")
     try:
@@ -415,8 +418,104 @@ with tab2:
         st.write(files)
     except Exception as e:
         st.error(f"Failed to list bucket: {e}")
+        files = []
 
-    if st.button("Load index from Supabase (if index.bin exists)"):
+    # build an options list for user selection (use name or path)
+    file_names = []
+    if isinstance(files, list):
+        for f in files:
+            # support different return shapes (dict-like or object)
+            if isinstance(f, dict) and "name" in f:
+                file_names.append(f["name"])
+            else:
+                # try attribute access
+                try:
+                    file_names.append(getattr(f, "name"))
+                except Exception:
+                    # last resort: str(f)
+                    file_names.append(str(f))
+
+    if len(file_names) == 0:
+        st.info("No files found in bucket. Upload one in the Upload tab or check your Supabase bucket name / keys.")
+    else:
+        selected = st.selectbox("Select a file to inspect / build index from", file_names)
+        st.write("Selected file:", selected)
+
+        # preview: download and show first 1000 chars
+        if st.button("Preview selected file"):
+            try:
+                data = download_file_from_supabase(selected)
+                if data is None:
+                    st.warning("Could not download selected file (maybe path mismatch or permissions).")
+                else:
+                    try:
+                        text_preview = get_text_from_upload(data)
+                        st.text_area("File preview (first 4000 chars)", value=text_preview[:4000], height=300)
+                        # store preview text in session for convenience
+                        st.session_state["last_preview_text"] = text_preview
+                    except Exception as e:
+                        st.error(f"Failed to extract preview text: {e}")
+            except Exception as e:
+                st.error(f"Download failed: {e}")
+                st.write(traceback.format_exc())
+
+        # Build index from the selected file (server-side)
+        if st.button("Build index from selected file and upload index.bin"):
+            # first download file
+            try:
+                data = download_file_from_supabase(selected)
+                if data is None:
+                    st.error("Download returned no data. Check file path/permissions and that SUPABASE_KEY is service_role for private buckets.")
+                else:
+                    st.info("Extracting text from the file...")
+                    text = get_text_from_upload(data)
+                    if not text or len(text.strip()) == 0:
+                        st.error("Extracted no text from file. For PDFs or docx enable pdfplumber / python-docx and re-upload.")
+                    else:
+                        st.success(f"Extracted {len(text)} characters. Proceeding to build index (this may take a few seconds)...")
+                        # try to construct Document and build index
+                        if DetectedDocument is None or DetectedIndexClass is None:
+                            st.error("Detected Document or Index class is missing in the installed llama-index package. Cannot build a vector index here.")
+                            st.info("Options: (1) Pin llama-index==0.10.17 in requirements.txt and redeploy, or (2) use OpenAI fallback in Query tab.")
+                        else:
+                            # instantiate Document (try a couple of constructor styles)
+                            try:
+                                doc = DetectedDocument(text=text, metadata={"source": selected})
+                            except Exception:
+                                try:
+                                    doc = DetectedDocument(text, {"source": selected})
+                                except Exception as e:
+                                    st.error(f"Failed to instantiate Document: {e}")
+                                    st.write(traceback.format_exc())
+                                    raise
+
+                            try:
+                                if hasattr(DetectedIndexClass, "from_documents"):
+                                    idx = DetectedIndexClass.from_documents([doc])
+                                else:
+                                    idx = DetectedIndexClass([doc])
+                            except Exception as e:
+                                st.error(f"Index construction failed: {e}")
+                                st.write(traceback.format_exc())
+                                raise
+
+                            # persist and upload index
+                            try:
+                                idx_path = save_index_to_tempfile(idx, filename="index.bin")
+                                with open(idx_path, "rb") as fh:
+                                    upload_resp = upload_file_to_supabase(fh.read(), "index.bin")
+                                st.success("Index built and uploaded to Supabase as index.bin")
+                                st.session_state["index"] = idx
+                            except Exception as e:
+                                st.error(f"Failed to persist/upload index.bin: {e}")
+                                st.write(traceback.format_exc())
+            except Exception as e:
+                st.error(f"Unexpected error during build: {e}")
+                st.write(traceback.format_exc())
+
+    # Load index from Supabase (existing index.bin)
+    st.markdown("---")
+    if st.button("Load index.bin from Supabase into session"):
         try:
             data = download_file_from_supabase("index.bin")
             if data is None:
@@ -431,17 +530,17 @@ with tab2:
                     st.session_state["index"] = idx
                     st.success("Index loaded into session.")
                 except Exception as e:
-                    st.error(f"Failed to load index: {e}")
+                    st.error(f"Failed to load index from disk: {e}")
                     st.write(traceback.format_exc())
                 finally:
                     try:
                         os.unlink(tmp.name)
                     except Exception:
                         pass
-        except Exception as e:
-            st.error(f"Download failed: {e}")
-            st.write(traceback.format_exc())
 
+# ---------------------------
+# Query tab
+# ---------------------------
 with tab3:
     st.header("Query the index / uploaded document")
     # prefer vector index if present in session
@@ -486,5 +585,4 @@ with tab3:
                     st.write(ans)
         else:
             st.info("No index loaded and no uploaded text available. Upload a file in 'Upload' tab first.")
-
 # end of file
