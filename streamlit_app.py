@@ -44,24 +44,27 @@ Document = None
 IndexVectorClass = None
 IndexSimpleClass = None
 
-# DEBUG: show installed llama_index info
+# --- DIAGNOSTIC: show where llama_index is coming from and what version (paste output here) ---
+import importlib, sys, pkgutil, traceback
+
 try:
-    import importlib, sys
     li = importlib.import_module("llama_index")
-    ver = getattr(li, "__version__", None)
-    st.write("llama_index module:", li)
-    st.write("llama_index.__version__:", ver)
-    # show names that look relevant
-    candidates = [n for n in dir(li) if "Index" in n or "Document" in n or "vector" in n.lower()]
-    st.write("llama_index candidates:", candidates[:200])
+    st.write("llama_index module object:", li)
+    st.write("llama_index __file__:", getattr(li, "__file__", None))
+    st.write("llama_index __path__:", getattr(li, "__path__", None))
+    st.write("Sample dir(llama_index):", [n for n in dir(li)][:200])
 except Exception as e:
-    st.write("Failed to import llama_index:", e)
-    # also try import by top-level name alternative
-    try:
-        import llama_index as LI
-        st.write("Imported llama_index by alternative name; version:", getattr(LI, "__version__", "unknown"))
-    except Exception:
-        st.write("llama_index import totally failed")
+    st.write("Importing llama_index raised:", e)
+    st.write(traceback.format_exc())
+
+# Try to show pip-installed distribution version for llama-index package
+try:
+    import pkg_resources
+    dist = pkg_resources.get_distribution("llama-index")
+    st.write("pip distribution llama-index:", dist.project_name, dist.version, dist.location)
+except Exception as e:
+    st.write("pkg_resources couldn't find llama-index distribution or failed:", e)
+
 
 # Document fallbacks
 try:
